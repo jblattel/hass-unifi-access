@@ -1,8 +1,6 @@
 """Unifi Access Hub.
-
 This module interacts with the Unifi Access API server.
 """
-
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
@@ -12,12 +10,10 @@ import ssl
 from threading import Thread
 from typing import Any, Literal, TypedDict, cast
 from urllib.parse import urlparse
-
 from requests import request
 from requests.exceptions import ConnectionError as ConnError, SSLError
 import urllib3
 import websocket
-
 from .const import (
     ACCESS_EVENT,
     DEVICE_NOTIFICATIONS_URL,
@@ -32,51 +28,39 @@ from .const import (
 )
 from .door import UnifiAccessDoor
 from .errors import ApiAuthError, ApiError
-
 _LOGGER = logging.getLogger(__name__)
-
 type EmergencyData = dict[str, bool]
-
-
 class DoorLockRule(TypedDict):
     """DoorLockRule.
-
     This class defines the different locking rules.
     """
-
     type: Literal["keep_lock", "keep_unlock", "custom", "reset", "lock_early"]
     interval: int
-
-
 class DoorLockRuleStatus(TypedDict):
     """DoorLockRuleStatus.
-
     This class defines the active locking rule status.
     """
-
     type: Literal["schedule", "keep_lock", "keep_unlock", "custom", "lock_early", ""]
     ended_time: int
-
-
 class UnifiAccessHub:
     """UnifiAccessHub.
-
     This class takes care of interacting with the Unifi Access API.
     """
-
     def __init__(
-        self, host: str, verify_ssl: bool = False, use_polling: bool = False
+        self, host: str, hass=None, config_entry=None, verify_ssl: bool = False, use_polling: bool = False
     ) -> None:
         """Initialize."""
         self.use_polling = use_polling
         self.verify_ssl = verify_ssl
+        self._hass = hass
+        self._config_entry = config_entry
+        self._door_associations = {}
+        
         if self.verify_ssl is False:
             _LOGGER.warning("SSL Verification disabled for %s", host)
             urllib3.disable_warnings()
-
         host_parts = host.split(":")
         parsed_host = urlparse(host)
-
         hostname = parsed_host.hostname if parsed_host.hostname else host_parts[0]
         port = (
             parsed_host.port
@@ -101,18 +85,41 @@ class UnifiAccessHub:
         self.update_t = None
         self._callbacks: set[Callable] = set()
         self.loop = asyncio.get_event_loop()
-
+        
+        # Load associations from config entry on initialization
+        self._load_from_config_entry()
+        
     @property
     def doors(self):
         """Get current doors."""
         return self._doors
-
+        
+    def _load_from_config_entry(self):
+        """Load door associations from config entry on initialization."""
+        if self._config_entry and self._hass:
+            try:
+                assocs = self._config_entry.data.get("door_associations", {})
+                for door_id, assoc in assocs.items():
+                    self._door_associations[door_id] = assoc
+                _LOGGER.debug("Loaded %d door associations from config entry", len(assocs))
+            except Exception as e:
+                _LOGGER.debug("Failed to load associations from config entry: %s", e)
+                
+    def _load_associations(self):
+        """Load associations after WebSocket connects."""
+        if self._door_associations:
+            for door_id, assoc in self._door_associations.items():
+                if door_id in self.doors:
+                    door = self.doors[door_id]
+                    door.hub_id = assoc["hub_id"]
+                    door.hub_type = assoc["hub_type"]
+                    _LOGGER.debug("Loaded door %s -> hub %s", door_id, assoc["hub_id"])
+        
     def set_api_token(self, api_token):
         """Set API Access Token."""
         self._api_token = api_token
         self._http_headers["Authorization"] = f"Bearer {self._api_token}"
         self._websocket_headers["Authorization"] = f"Bearer {self._api_token}"
-
     def update(self):
         """Get latest door data."""
         _LOGGER.debug(
@@ -122,7 +129,6 @@ class UnifiAccessHub:
             self.doors.keys(),
         )
         data = self._make_http_request(f"{self.host}{DOORS_URL}")
-
         for _i, door in enumerate(data):
             if door["is_bind_hub"] is True:
                 door_id = door["id"]
@@ -170,14 +176,11 @@ class UnifiAccessHub:
                     )
             else:
                 _LOGGER.debug("Door %s is not bound to a hub. Ignoring", door)
-
         if self.update_t is None and self.use_polling is False:
             _LOGGER.debug("Starting continuous updates. Polling disabled")
             self.start_continuous_updates()
-
         _LOGGER.debug("Got doors %s", self.doors)
         return self._doors
-
     def authenticate(self, api_token: str) -> str:
         """Test if we can authenticate with the host."""
         self.set_api_token(api_token)
@@ -200,9 +203,7 @@ class UnifiAccessHub:
         except ConnError:
             _LOGGER.error("Cannot connect to %s", self.host)
             return "cannot_connect"
-
         return "ok"
-
     def get_door_lock_rule(self, door_id: str) -> DoorLockRuleStatus:
         """Get door lock rule."""
         _LOGGER.debug("Getting door lock rule for door_id %s", door_id)
@@ -216,7 +217,6 @@ class UnifiAccessHub:
             self.supports_door_lock_rules = False
             _LOGGER.debug("cannot get door lock rule. Likely unsupported hub")
             return {"type": "", "ended_time": 0}
-
     def set_door_lock_rule(self, door_id: str, door_lock_rule: DoorLockRule) -> None:
         """Set door lock rule."""
         _LOGGER.info(
@@ -230,7 +230,6 @@ class UnifiAccessHub:
         self.doors[door_id].lock_rule = door_lock_rule["type"]
         if door_lock_rule["type"] == "custom":
             self.doors[door_id].interval = door_lock_rule["interval"]
-
     def get_doors_emergency_status(self) -> EmergencyData:
         """Get doors emergency status."""
         _LOGGER.debug("Getting doors emergency status")
@@ -239,7 +238,6 @@ class UnifiAccessHub:
         self.lockdown = data["lockdown"]
         _LOGGER.debug("Got doors emergency status %s", data)
         return data
-
     def set_doors_emergency_status(self, emergency_data: EmergencyData) -> None:
         """Set doors emergency status."""
         _LOGGER.info("Setting doors emergency status %s", emergency_data)
@@ -249,14 +247,12 @@ class UnifiAccessHub:
         self.evacuation = emergency_data.get("evacuation", self.evacuation)
         self.lockdown = emergency_data.get("lockdown", self.lockdown)
         _LOGGER.debug("Emergency status set %s", emergency_data)
-
     def unlock_door(self, door_id: str) -> None:
         """Test if we can authenticate with the host."""
         _LOGGER.info("Unlocking door with id %s", door_id)
         self._make_http_request(
             f"{self.host}{DOOR_UNLOCK_URL}".format(door_id=door_id), "PUT"
         )
-
     def _make_http_request(self, url, method="GET", data=None) -> dict:
         """Make HTTP request to Unifi Access API server."""
         _LOGGER.debug(
@@ -270,19 +266,13 @@ class UnifiAccessHub:
             json=data,
             timeout=10,
         )
-
         if r.status_code == 401:
             raise ApiAuthError
-
         if r.status_code != 200:
             raise ApiError
-
         response = r.json()
-
         _LOGGER.debug("HTTP Response %s", response)
-
         return response["data"]
-
     def _get_thumbnail_image(self, url) -> bytes:
         """Get image from Unifi Access API server."""
         _LOGGER.debug("Getting thumbnail with URL %s", url)
@@ -293,15 +283,12 @@ class UnifiAccessHub:
             verify=self.verify_ssl,
             timeout=10,
         )
-
         if r.status_code == 401:
             raise ApiAuthError
-
         if r.status_code != 200:
             raise ApiError
         _LOGGER.debug("Got thumbnail response")
         return r.content
-
     def _handle_location_update_v2(self, update):
         """Process location update V2."""
         existing_door = None
@@ -349,10 +336,8 @@ class UnifiAccessHub:
                     except (ApiError, ApiAuthError):
                         _LOGGER.error("Could not get thumbnail for door id %s", door_id)
         return existing_door
-
     def on_message(self, ws: websocket.WebSocketApp, message):
         """Handle messages received on the websocket client.
-
         Doorbell presses are relying on door names so if those are not unique, it may cause some issues
         """
         event = None
@@ -388,7 +373,7 @@ class UnifiAccessHub:
                             if door.name == door_name
                         ),
                         None,
-                    )  # FIXME this is likely unreliable. API does not seem to provide door id forthis access.remote_view  # pylint: disable=fixme
+                    ) # FIXME this is likely unreliable. API does not seem to provide door id forthis access.remote_view # pylint: disable=fixme
                     if existing_door is not None:
                         existing_door.doorbell_request_id = update["data"]["request_id"]
                         event = "doorbell_press"
@@ -449,6 +434,26 @@ class UnifiAccessHub:
                             existing_door.hub_type,
                             existing_door.hub_id,
                         )
+                        
+                        # Store for persistence
+                        self._door_associations[door_id] = {
+                            "hub_id": device_id,
+                            "hub_type": device_type
+                        }
+
+                        # Save if hass available
+                        if self._hass:
+                            try:
+                                entries = self._hass.config_entries.async_entries("unifi_access")
+                                if entries:
+                                    config_entry = entries[0]
+                                    assocs = config_entry.data.get("door_associations", {})
+                                    assocs[door_id] = self._door_associations[door_id]
+                                    self._hass.config_entries.async_update_entry(
+                                        config_entry, data={**config_entry.data, "door_associations": assocs}
+                                    )
+                            except:
+                                pass  # Silent fail in WebSocket thread
                 case "access.logs.add":
                     _LOGGER.debug("access.logs.add %s", update["data"])
                     door = next(
@@ -527,7 +532,6 @@ class UnifiAccessHub:
                                 "door_id": existing_door.id,
                                 "type": DOORBELL_START_EVENT,
                             }
-
                             # We don't seem to get a message that indicates the end of the doorbell being active
                             # We just toggle the sensor for 2 seconds and return it to its original state
                             def on_complete(_fut):
@@ -540,7 +544,6 @@ class UnifiAccessHub:
                                 }
                                 asyncio.sleep(2)
                                 existing_door.trigger_event(event, event_attributes)
-
                             event_done_callback = on_complete
                             _LOGGER.info(
                                 "Hardware doorbell press on %s request id %s",
@@ -558,7 +561,6 @@ class UnifiAccessHub:
                     )
                 case _:
                     _LOGGER.debug("unhandled websocket message %s", update["event"])
-
             if existing_door:
                 asyncio.run_coroutine_threadsafe(
                     existing_door.publish_updates(), self.loop
@@ -573,15 +575,13 @@ class UnifiAccessHub:
                     )
                     if event_done_callback is not None:
                         task.add_done_callback(event_done_callback)
-
     def on_error(self, ws: websocket.WebSocketApp, error):
         """Handle errors in the websocket client."""
         _LOGGER.exception("Got websocket error %s", error)
-
     def on_open(self, ws: websocket.WebSocketApp):
         """Show message on connection."""
         _LOGGER.info("Websocket connection established")
-
+        self._load_associations()
     def on_close(self, ws: websocket.WebSocketApp, close_status_code, close_msg):
         """Handle websocket closures."""
         _LOGGER.error(
@@ -593,14 +593,12 @@ class UnifiAccessHub:
         if self.verify_ssl is False:
             sslopt = {"cert_reqs": ssl.CERT_NONE}
         ws.run_forever(sslopt=sslopt, reconnect=5)
-
     def start_continuous_updates(self):
         """Start listening for updates in a separate thread using websocket-client."""
         self.update_t = Thread(target=self.listen_for_updates)
         self.update_t.daemon = True
         self.update_t.start()
         _LOGGER.info("Started websocket client in a new thread")
-
     def listen_for_updates(self):
         """Create a websocket client and start listening for updates."""
         uri = f"{self.websocket_host}{DEVICE_NOTIFICATIONS_URL}"
@@ -617,15 +615,12 @@ class UnifiAccessHub:
         if self.verify_ssl is False:
             sslopt = {"cert_reqs": ssl.CERT_NONE}
         ws.run_forever(sslopt=sslopt, reconnect=5)
-
     def register_callback(self, callback: Callable[[], None]) -> None:
         """Register callback, called when settings change."""
         self._callbacks.add(callback)
-
     def remove_callback(self, callback: Callable[[], None]) -> None:
         """Remove previously registered callback."""
         self._callbacks.discard(callback)
-
     async def publish_updates(self) -> None:
         """Schedule call all registered callbacks."""
         for callback in self._callbacks:
